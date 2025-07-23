@@ -32,6 +32,7 @@ struct package {
 	int recv;
 	int init;
 	int closed;
+	int proxy;
 
 	int header_sz;
 	uint8_t header[2];
@@ -181,8 +182,75 @@ command(struct skynet_context *ctx, struct package *P, int session, uint32_t sou
 	};
 }
 
+static int
+parse_proxy_v1(struct package *P, const uint8_t *msg, int sz) {
+	if (P->proxy == 1) {
+		// 找到 \r
+		int len = 108; // proxy protocol v1 最大长度
+		len = sz > len ? len : sz;
+		for (int i = 0; i < len; ++i) {
+			if (msg[i] == '\r') {
+				P->proxy = 2; // 进入代理模式
+				if (i + 1 < sz && msg[i + 1] == '\n') {
+					// 找到 \r\n
+					P->proxy = 3; // 关闭代理模式
+					memcpy(P->uncomplete.msg + P->uncomplete.sz, msg, i + 2);
+					P->uncomplete.sz = i + 2;
+					return i + 2; // 返回 \r\n 的长度
+				} else {
+					memcpy(P->uncomplete.msg + P->uncomplete.sz, msg, i + 1);
+					P->uncomplete.sz = i + 1;
+				}
+			}
+		}
+	} else if (P->proxy == 2) {
+		// 继续寻找 \n
+		if (sz >0 ) {
+			assert(msg[0] == '\n');
+			P->proxy = 3; // 关闭代理模式
+			memcpy(P->uncomplete.msg + P->uncomplete.sz, msg, 1);
+			P->uncomplete.sz += 1;
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static void
 new_message(struct package *P, const uint8_t *msg, int sz) {
+	if (P->proxy >= 0 && P->proxy < 3) {
+		assert(P->recv == 0);
+		assert(P->uncomplete_sz == -1);
+		int proxy_len = 0;
+		if (P->proxy == 0) {
+			if (sz >= 6 && strncmp((const char*)msg, "PROXY ", 6) == 0) {
+				P->proxy = 1;
+				P->uncomplete.sz = 0;
+				P->uncomplete.msg = skynet_malloc(108);
+				proxy_len = parse_proxy_v1(P, msg, sz);
+			} else {
+				P->proxy = -1;
+				proxy_len = -1;
+			}
+		} else if (P->proxy == 1) {
+			proxy_len = parse_proxy_v1(P, msg, sz);
+		} else if (P->proxy == 2) {
+			proxy_len = parse_proxy_v1(P, msg, sz);
+		}
+		if (proxy_len == 0) {
+			// 还没解析完
+			return;
+		}
+
+		if (P->proxy == 3) {
+			assert(proxy_len > 0);
+			msg += proxy_len;
+			sz -= proxy_len;
+			queue_push(&P->response, &P->uncomplete);
+			P->uncomplete_sz = -1;
+		}
+	}
+
 	++P->recv;
 	for (;;) {
 		if (P->uncomplete_sz >= 0) {
