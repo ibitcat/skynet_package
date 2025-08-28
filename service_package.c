@@ -5,7 +5,19 @@
 #include <string.h>
 #include <assert.h>
 
-#define TIMEOUT "1000"	// 10s
+// 10s
+#ifndef TIMEOUT
+#define TIMEOUT "1000"
+#endif
+
+#ifndef PKT_HEAD_LEN
+#define PKT_HEAD_LEN 2
+#endif
+
+// 默认大端
+#ifndef PKT_LITTLE_ENDIAN
+#define PKT_LITTLE_ENDIAN 0
+#endif
 
 struct response {
 	size_t sz;
@@ -32,7 +44,7 @@ struct package {
 	int recv;
 	int init;
 	int closed;
-	int proxy;
+	int8_t proxy;
 
 	int header_sz;
 	uint8_t header[2];
@@ -359,15 +371,28 @@ heartbeat(struct skynet_context *ctx, struct package *P) {
 
 static void
 send_out(struct skynet_context *ctx, struct package *P, const void *msg, size_t sz) {
-	if (sz > 0xffff) {
+	int little_endian = PKT_LITTLE_ENDIAN;
+	int head_byte_num = PKT_HEAD_LEN;
+	uint32_t limit = (1 << (head_byte_num * 8)) - 1;
+	if (sz > limit) {
 		skynet_error(ctx, "package too long (%08x)", (uint32_t)sz);
 		return;
 	}
-	uint8_t *p = skynet_malloc(sz + 2);
-	p[0] = (sz & 0xff00) >> 8;
-	p[1] = sz & 0xff;
-	memcpy(p+2, msg, sz);
-	skynet_socket_send(ctx, P->fd, p, sz+2);
+
+	//skynet_error(ctx, "send_out size=%d, endian=%d, byte_num=%d", sz, little_endian, head_byte_num);
+	uint8_t *p = skynet_malloc(sz + head_byte_num);
+	if (little_endian == 1){
+		// little endian
+		for (size_t i = 0; i < head_byte_num; i++) {
+			p[i] = (sz >> (8 * i)) & 0xff;
+		}
+	} else {
+		for (size_t i = 0; i < head_byte_num; i++) {
+			p[i] = (sz >> (8 * (head_byte_num - 1 - i))) & 0xff;
+		}
+	}
+	memcpy(p+head_byte_num, msg, sz);
+	skynet_socket_send(ctx, P->fd, p, sz+head_byte_num);
 }
 
 static int
