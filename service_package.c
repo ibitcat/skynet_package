@@ -19,6 +19,19 @@
 #define PKT_LITTLE_ENDIAN 0
 #endif
 
+// proxy protocol v2 头部长度
+#define PROXY_HEAD_LEN 16
+#define PROXY_MAX_LEN 528
+
+static const uint8_t proxy_v1_sig[6] = {
+	'P', 'R', 'O', 'X', 'Y', ' '
+};
+static const uint8_t proxy_v2_sig[12] = {
+	0x0D, 0x0A, 0x0D, 0x0A,
+	0x00, 0x0D, 0x0A, 0x51,
+	0x55, 0x49, 0x54, 0x0A
+};
+
 struct response {
 	size_t sz;
 	void * msg;
@@ -44,7 +57,10 @@ struct package {
 	int recv;
 	int init;
 	int closed;
-	int8_t proxy;
+
+	// proxy protocol
+	int8_t proxy_version;		// 0=协议未决，1=v1，2=v2，-1=无代理协议
+	int8_t proxy_status;		// 0=开始解析，1=解析中，-1=解析完/解析失败
 
 	int header_sz;
 	uint8_t header[2];
@@ -194,72 +210,107 @@ command(struct skynet_context *ctx, struct package *P, int session, uint32_t sou
 	};
 }
 
-static int
-parse_proxy_v1(struct package *P, const uint8_t *msg, int sz) {
-	if (P->proxy == 1) {
-		// 找到 \r
-		int len = 108; // proxy protocol v1 最大长度
-		len = sz > len ? len : sz;
-		for (int i = 0; i < len; ++i) {
-			if (msg[i] == '\r') {
-				P->proxy = 2; // 进入代理模式
-				if (i + 1 < sz && msg[i + 1] == '\n') {
-					// 找到 \r\n
-					P->proxy = 3; // 关闭代理模式
-					memcpy(P->uncomplete.msg + P->uncomplete.sz, msg, i + 2);
-					P->uncomplete.sz = i + 2;
-					return i + 2; // 返回 \r\n 的长度
+static void
+new_message(struct package *P, const uint8_t *msg, int sz) {
+	// 注意：该处理方式在不使用代理时，需要第一个包的大小至少为 16 字节
+	// 解析 proxy header
+	// v1: 6 字节 "PROXY "
+	// v2: 16 字节头部
+	if (P->proxy_status == 0) {
+		// 初始化一个
+		P->uncomplete.sz = PROXY_MAX_LEN;
+		P->uncomplete.msg = skynet_malloc(PROXY_MAX_LEN);
+		P->uncomplete_sz = PROXY_MAX_LEN;
+		P->proxy_status = 1;
+	}
+
+	if (P->proxy_status == 1) {
+		// 接收数据
+		if (sz >= P->uncomplete_sz) {
+			memcpy(P->uncomplete.msg + P->uncomplete.sz - P->uncomplete_sz, msg, P->uncomplete_sz);
+			msg += P->uncomplete_sz;
+			sz -= P->uncomplete_sz;
+			P->uncomplete_sz = 0;
+		} else {
+			memcpy(P->uncomplete.msg + P->uncomplete.sz - P->uncomplete_sz, msg, sz);
+			P->uncomplete_sz -= sz;
+			msg += sz;
+			sz = 0;
+		}
+
+		// 解析 proxy header
+		int received = P->uncomplete.sz - P->uncomplete_sz;
+		if (P->proxy_version == 0) {
+			if (received >= 6 && (memcmp(P->uncomplete.msg, proxy_v1_sig, 6) == 0)) {
+				// v1 协议
+				P->proxy_version = 1;
+			} else if (received >= PROXY_HEAD_LEN) {
+				if ((memcmp(P->uncomplete.msg, proxy_v2_sig, 12) == 0)) {
+					// v2 协议
+					P->proxy_version = 2;
 				} else {
-					memcpy(P->uncomplete.msg + P->uncomplete.sz, msg, i + 1);
-					P->uncomplete.sz = i + 1;
+					// 无代理协议
+					P->proxy_version = -1;
 				}
 			}
 		}
-	} else if (P->proxy == 2) {
-		// 继续寻找 \n
-		if (sz >0 ) {
-			assert(msg[0] == '\n');
-			P->proxy = 3; // 关闭代理模式
-			memcpy(P->uncomplete.msg + P->uncomplete.sz, msg, 1);
-			P->uncomplete.sz += 1;
-			return 1;
-		}
-	}
-	return 0;
-}
-
-static void
-new_message(struct package *P, const uint8_t *msg, int sz) {
-	if (P->proxy >= 0 && P->proxy < 3) {
-		assert(P->recv == 0);
-		assert(P->uncomplete_sz == -1);
-		int proxy_len = 0;
-		if (P->proxy == 0) {
-			if (sz >= 6 && strncmp((const char*)msg, "PROXY ", 6) == 0) {
-				P->proxy = 1;
-				P->uncomplete.sz = 0;
-				P->uncomplete.msg = skynet_malloc(108);
-				proxy_len = parse_proxy_v1(P, msg, sz);
-			} else {
-				P->proxy = -1;
-				proxy_len = -1;
-			}
-		} else if (P->proxy == 1) {
-			proxy_len = parse_proxy_v1(P, msg, sz);
-		} else if (P->proxy == 2) {
-			proxy_len = parse_proxy_v1(P, msg, sz);
-		}
-		if (proxy_len == 0) {
-			// 还没解析完
+		if (P->proxy_version == 0) {
+			// 还不能确定协议类型，继续接收
 			return;
 		}
 
-		if (P->proxy == 3) {
-			assert(proxy_len > 0);
-			msg += proxy_len;
-			sz -= proxy_len;
+		// 判断是否接收完毕
+		if (P->proxy_version == 1) {
+			// v1 协议，找到 \r\n 结束符
+			int v1_len = -1;
+			uint8_t *pmsg = (uint8_t *)P->uncomplete.msg;
+			for (int i = 0; i < received - 1; i++) {
+				if (pmsg[i] == '\r' && pmsg[i+1] == '\n') {
+					// 找到结束符
+					v1_len = i + 2;
+					break;
+				}
+			}
+			if (v1_len < 0) {
+				// 还未接收完毕，继续接收
+				return;
+			}
+			// 已经接收完毕, 重新分配缓冲区
+			P->uncomplete.sz = v1_len;
+			P->uncomplete.msg = skynet_malloc(P->uncomplete.sz);
+			memcpy(P->uncomplete.msg, pmsg, v1_len);
 			queue_push(&P->response, &P->uncomplete);
 			P->uncomplete_sz = -1;
+			P->proxy_status = -1;
+
+			// 剩余的
+			new_message(P, pmsg + v1_len, received - v1_len);
+			skynet_free(pmsg);
+		} else if (P->proxy_version == 2) {
+			// v2 协议，判断是否接收完毕
+			uint8_t *pmsg = (uint8_t *)P->uncomplete.msg;
+			int payload_len = (pmsg[14] << 8) | pmsg[15];
+			int proxy_len = PROXY_HEAD_LEN + payload_len;
+			if (received < proxy_len) {
+				// 还未接收完毕，继续接收
+				return;
+			}
+
+			// 已经接收完毕,重新分配缓冲区
+			P->uncomplete.sz = proxy_len;
+			P->uncomplete.msg = skynet_malloc(proxy_len);
+			memcpy(P->uncomplete.msg, pmsg, proxy_len);
+			queue_push(&P->response, &P->uncomplete);
+			P->uncomplete_sz = -1;
+			P->proxy_status = -1;
+
+			// 剩余的
+			new_message(P, pmsg + proxy_len, received - proxy_len);
+			skynet_free(pmsg);
+		} else if (P->proxy_version == -1) {
+			// 无代理协议，直接继续后续处理
+			P->proxy_status = -1;
+			new_message(P, P->uncomplete.msg, received);
 		}
 	}
 
