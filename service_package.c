@@ -10,15 +10,6 @@
 #define TIMEOUT "1000"
 #endif
 
-#ifndef PKT_HEAD_LEN
-#define PKT_HEAD_LEN 2
-#endif
-
-// 默认大端
-#ifndef PKT_LITTLE_ENDIAN
-#define PKT_LITTLE_ENDIAN 0
-#endif
-
 // proxy protocol v2 头部长度
 #define PROXY_HEAD_LEN 16
 #define PROXY_MAX_LEN 528
@@ -260,10 +251,10 @@ new_message(struct package *P, const uint8_t *msg, int sz) {
 		}
 
 		// 判断是否接收完毕
+		uint8_t *pmsg = (uint8_t *)P->uncomplete.msg;
 		if (P->proxy_version == 1) {
 			// v1 协议，找到 \r\n 结束符
 			int v1_len = -1;
-			uint8_t *pmsg = (uint8_t *)P->uncomplete.msg;
 			for (int i = 0; i < received - 1; i++) {
 				if (pmsg[i] == '\r' && pmsg[i+1] == '\n') {
 					// 找到结束符
@@ -288,7 +279,6 @@ new_message(struct package *P, const uint8_t *msg, int sz) {
 			skynet_free(pmsg);
 		} else if (P->proxy_version == 2) {
 			// v2 协议，判断是否接收完毕
-			uint8_t *pmsg = (uint8_t *)P->uncomplete.msg;
 			int payload_len = (pmsg[14] << 8) | pmsg[15];
 			int proxy_len = PROXY_HEAD_LEN + payload_len;
 			if (received < proxy_len) {
@@ -310,7 +300,9 @@ new_message(struct package *P, const uint8_t *msg, int sz) {
 		} else if (P->proxy_version == -1) {
 			// 无代理协议，直接继续后续处理
 			P->proxy_status = -1;
+			P->uncomplete_sz = -1;
 			new_message(P, P->uncomplete.msg, received);
+			skynet_free(pmsg);
 		}
 	}
 
@@ -422,28 +414,15 @@ heartbeat(struct skynet_context *ctx, struct package *P) {
 
 static void
 send_out(struct skynet_context *ctx, struct package *P, const void *msg, size_t sz) {
-	int little_endian = PKT_LITTLE_ENDIAN;
-	int head_byte_num = PKT_HEAD_LEN;
-	uint32_t limit = (1 << (head_byte_num * 8)) - 1;
-	if (sz > limit) {
+	if (sz > 0xffff) {
 		skynet_error(ctx, "package too long (%08x)", (uint32_t)sz);
 		return;
 	}
-
-	//skynet_error(ctx, "send_out size=%d, endian=%d, byte_num=%d", sz, little_endian, head_byte_num);
-	uint8_t *p = skynet_malloc(sz + head_byte_num);
-	if (little_endian == 1){
-		// little endian
-		for (size_t i = 0; i < head_byte_num; i++) {
-			p[i] = (sz >> (8 * i)) & 0xff;
-		}
-	} else {
-		for (size_t i = 0; i < head_byte_num; i++) {
-			p[i] = (sz >> (8 * (head_byte_num - 1 - i))) & 0xff;
-		}
-	}
-	memcpy(p+head_byte_num, msg, sz);
-	skynet_socket_send(ctx, P->fd, p, sz+head_byte_num);
+	uint8_t *p = skynet_malloc(sz + 2);
+	p[0] = (sz & 0xff00) >> 8;
+	p[1] = sz & 0xff;
+	memcpy(p+2, msg, sz);
+	skynet_socket_send(ctx, P->fd, p, sz+2);
 }
 
 static int
