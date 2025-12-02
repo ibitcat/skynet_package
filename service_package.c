@@ -201,9 +201,29 @@ command(struct skynet_context *ctx, struct package *P, int session, uint32_t sou
 	};
 }
 
+static int
+check_proxy_protocol(const uint8_t *msg, size_t sz, const uint8_t *sig, size_t sig_sz) {
+	int maybe = 0; // 0=未决;-1=否定;1=肯定
+	for (size_t i = 0; i < sig_sz; i++) {
+		if (i < sz ) {
+			if (msg[i] != sig[i]) {
+				// 提前否定
+				maybe = -1;
+				break;
+			}
+		} else {
+			// 未决
+			break;
+		}
+	}
+	if (maybe == 0 && sz >= sig_sz) {
+		maybe = 1;
+	}
+	return maybe;
+}
+
 static void
 new_message(struct package *P, const uint8_t *msg, int sz) {
-	// 注意：该处理方式在不使用代理时，需要第一个包的大小至少为 16 字节
 	// 解析 proxy header
 	// v1: 6 字节 "PROXY "
 	// v2: 16 字节头部
@@ -231,18 +251,22 @@ new_message(struct package *P, const uint8_t *msg, int sz) {
 
 		// 解析 proxy header
 		int received = P->uncomplete.sz - P->uncomplete_sz;
+		//printf("received = %d\n", received);
+		uint8_t *pmsg = (uint8_t *)P->uncomplete.msg;
 		if (P->proxy_version == 0) {
-			if (received >= 6 && (memcmp(P->uncomplete.msg, proxy_v1_sig, 6) == 0)) {
+			int maybe_v1 = check_proxy_protocol(pmsg, received, proxy_v1_sig, 6);
+			int maybe_v2 = check_proxy_protocol(pmsg, received, proxy_v2_sig, 12);
+			if (maybe_v1 == 1) {
 				// v1 协议
 				P->proxy_version = 1;
-			} else if (received >= PROXY_HEAD_LEN) {
-				if ((memcmp(P->uncomplete.msg, proxy_v2_sig, 12) == 0)) {
-					// v2 协议
-					P->proxy_version = 2;
-				} else {
-					// 无代理协议
-					P->proxy_version = -1;
-				}
+			} else if (maybe_v2 == 1) {
+				// v2 协议
+				P->proxy_version = 2;
+			}
+
+			if (maybe_v1 == -1 && maybe_v2 == -1) {
+				// 无代理协议
+				P->proxy_version = -1;
 			}
 		}
 		if (P->proxy_version == 0) {
@@ -251,7 +275,6 @@ new_message(struct package *P, const uint8_t *msg, int sz) {
 		}
 
 		// 判断是否接收完毕
-		uint8_t *pmsg = (uint8_t *)P->uncomplete.msg;
 		if (P->proxy_version == 1) {
 			// v1 协议，找到 \r\n 结束符
 			int v1_len = -1;
@@ -279,10 +302,16 @@ new_message(struct package *P, const uint8_t *msg, int sz) {
 			skynet_free(pmsg);
 		} else if (P->proxy_version == 2) {
 			// v2 协议，判断是否接收完毕
+			if (received < PROXY_HEAD_LEN) {
+				// 头部还未接收完毕，继续接收
+				return;
+			}
+
+			// 读取负载长度
 			int payload_len = (pmsg[14] << 8) | pmsg[15];
 			int proxy_len = PROXY_HEAD_LEN + payload_len;
 			if (received < proxy_len) {
-				// 还未接收完毕，继续接收
+				// 负载还未接收完毕，继续接收
 				return;
 			}
 
